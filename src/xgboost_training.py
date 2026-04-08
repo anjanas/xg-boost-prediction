@@ -1,5 +1,10 @@
 """
-Train an XGBoost regressor to predict days_offset_from_due_date from invoice features.
+Train an XGBoost regressor to predict **days_offset_from_due_date** from non-leaking
+invoice features.
+
+``days_offset_from_due_date`` = ``paid_date - due_date`` in whole calendar days
+(date-only, midnight-normalized). Positive means paid after due; negative means paid before due.
+``paid_date`` is never a model input.
 """
 from __future__ import annotations
 
@@ -20,6 +25,31 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+# Synthetic B2B labels: map each known customer name to an industry (feature engineering).
+CUSTOMER_INDUSTRY: dict[str, str] = {
+    "Viktor Novak": "Manufacturing",
+    "Chen Okafor": "Construction",
+    "Liam Murphy": "Property management",
+    "James Patel": "Wholesale trade",
+    "Sofia Rossi": "Retail - hardware",
+    "Yuki Tanaka": "Facilities maintenance",
+    "Diego Kowalski": "Landscaping",
+    "Marcus Bishop": "Transportation / fleet",
+    "Aisha Hernandez": "Hospitality",
+    "Olivia Silva": "Real estate development",
+    "Zara Al-Farsi": "Education facilities",
+    "Ethan Park": "Agriculture",
+    "Priya Andersson": "Energy / utilities",
+    "Maria Nguyen": "Professional services",
+    "Nina Costa": "Municipal / public works",
+    "Noah Kim": "Healthcare facilities",
+}
+
+
+def customer_to_industry(customer: pd.Series) -> pd.Series:
+    return customer.map(CUSTOMER_INDUSTRY).fillna("unknown").astype(str)
+
+
 def load_invoices(csv_path: Path | None = None) -> pd.DataFrame:
     path = csv_path or _project_root() / "data" / "invoices.csv"
     df = pd.read_csv(path)
@@ -28,13 +58,32 @@ def load_invoices(csv_path: Path | None = None) -> pd.DataFrame:
     return df
 
 
-def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
-    """Return feature frame and target: days from due_date to paid_date (can be negative)."""
-    paid = pd.to_datetime(df["paid_date"], errors="coerce")
-    due = pd.to_datetime(df["due_date"], errors="coerce")
-    if paid.isna().any() or due.isna().any():
+def compute_days_offset_from_due_date(
+    paid: pd.Series,
+    due: pd.Series,
+) -> np.ndarray:
+    """
+    Target: ``days_offset_from_due_date`` = ``paid_date - due_date`` (calendar days).
+
+    paid_date and due_date are normalized to midnight so the delta is an integer day count.
+    """
+    paid_dt = pd.to_datetime(paid, errors="coerce")
+    due_dt = pd.to_datetime(due, errors="coerce")
+    if paid_dt.isna().any() or due_dt.isna().any():
         raise ValueError("paid_date or due_date has invalid or missing values.")
-    y = (paid.dt.normalize() - due.dt.normalize()).dt.days.astype(float).to_numpy()
+    return (
+        (paid_dt.dt.normalize() - due_dt.dt.normalize()).dt.days.astype(float).to_numpy()
+    )
+
+
+def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    Return ``X`` and ``y`` where ``y`` is **days_offset_from_due_date** only (see module
+    docstring). ``paid_date`` is dropped before features are finalized.
+    """
+    days_offset_from_due_date = compute_days_offset_from_due_date(
+        df["paid_date"], df["due_date"]
+    )
     feature_df = df.drop(columns=["paid_date"]).copy()
     feature_df["creation_date"] = pd.to_datetime(feature_df["creation_date"])
     feature_df["due_date"] = pd.to_datetime(feature_df["due_date"])
@@ -43,10 +92,17 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray]:
     feature_df["invoice_num"] = feature_df["invoice_id"].astype(str).str.extract(
         r"(\d+)", expand=False
     ).astype(float)
+    feature_df["industry"] = customer_to_industry(feature_df["customer"])
     feature_df = feature_df.drop(
-        columns=["creation_date", "due_date", "customer", "item_description", "invoice_id"]
+        columns=[
+            "creation_date",
+            "due_date",
+            "customer",
+            "item_description",
+            "invoice_id",
+        ]
     )
-    return feature_df, y
+    return feature_df, days_offset_from_due_date
 
 
 def train_val_test_split(
@@ -80,7 +136,7 @@ def make_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
         "due_epoch",
         "invoice_num",
     ]
-    categorical = ["payment_method", "payment_terms"]
+    categorical = ["payment_method", "payment_terms", "company", "industry"]
     return ColumnTransformer(
         transformers=[
             ("num", StandardScaler(), numeric),
@@ -118,10 +174,12 @@ def run_training(
     model_path: Path | None = None,
 ) -> tuple[RandomizedSearchCV, dict[str, float]]:
     df = load_invoices(csv_path)
-    X, y = build_features(df)
+    X, y_days_offset_from_due_date = build_features(df)
     preprocessor = make_preprocessor(X)
     X_train, X_val, X_test, y_train, y_val, y_test = train_val_test_split(
-        X, y, random_state=random_state
+        X,
+        y_days_offset_from_due_date,
+        random_state=random_state,
     )
 
     pipe = build_search_pipeline(preprocessor)
@@ -155,6 +213,7 @@ def run_training(
     joblib.dump(search.best_estimator_, out_path)
 
     metrics = {
+        "target": "days_offset_from_due_date",
         "best_cv_neg_mae": float(search.best_score_),
         "val_mae": float(mean_absolute_error(y_val, y_val_pred)),
         "test_mae": float(mean_absolute_error(y_test, y_test_pred)),
@@ -167,6 +226,7 @@ def run_training(
 
 def main() -> None:
     search, metrics = run_training()
+    print("Target: days_offset_from_due_date (paid_date - due_date, days)")
     print("Best params:", search.best_params_)
     print("Metrics:", metrics)
     print("Saved model:", metrics["model_path"])
