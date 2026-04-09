@@ -10,8 +10,8 @@ Prerequisites (typical):
     DescribeModelPackageGroup; optionally kms permissions on the bucket
 
 Usage:
-  export AWS_REGION=us-east-1
-  export SAGEMAKER_MODEL_BUCKET=my-bucket
+  Optionally set variables in a project-root .env file (e.g. SAGEMAKER_MODEL_BUCKET).
+  Or export AWS_REGION=us-east-1 and SAGEMAKER_MODEL_BUCKET=my-bucket, then:
   python scripts/register_sagemaker_model.py \\
     --joblib-path models/xgb_days_offset.joblib \\
     --model-package-group xgb-invoice-days-offset \\
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import tarfile
 from pathlib import Path
 
@@ -35,6 +36,20 @@ from botocore.exceptions import ClientError
 
 def _default_project_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE lines into os.environ if the key is unset (project-root .env)."""
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def _build_model_tar_gz(joblib_path: Path) -> bytes:
@@ -69,6 +84,7 @@ def _retrieve_sklearn_inference_image(region: str, sklearn_version: str) -> str:
 
 def main() -> None:
     root = _default_project_root()
+    _load_dotenv(root / ".env")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
         "--joblib-path",
@@ -114,7 +130,7 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    bucket = args.s3_bucket or __import__("os").environ.get("SAGEMAKER_MODEL_BUCKET")
+    bucket = args.s3_bucket or os.environ.get("SAGEMAKER_MODEL_BUCKET")
     if not bucket:
         raise SystemExit("Set --s3-bucket or environment variable SAGEMAKER_MODEL_BUCKET.")
 
